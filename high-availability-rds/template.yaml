@@ -1,0 +1,295 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: This template sets up a highly available FileMage cluster.
+
+Parameters:
+  VpcId:
+    Description: VPC ID
+    Type: AWS::EC2::VPC::Id
+  VpcCidr:
+    Description: VPC CIDR
+    Type: String
+  StaticIPforSSH:
+    Description: Static IP for SSH access
+    Type: String
+  VpcEc2Subnet1:
+    Description: EC2 subnet 1(AZ-a)
+    Type: AWS::EC2::Subnet::Id
+  VpcEc2Subnet2:
+    Description: EC2 subnet 2(AZ-c)
+    Type: AWS::EC2::Subnet::Id
+  VpcEc2Subnet3:
+    Description: EC2 subnet 3(AZ-d)
+    Type: AWS::EC2::Subnet::Id
+  Ec2InstanceType:
+    Description: EC2 InstanceType
+    Type: String
+    Default: m5.large
+  Ec2InstanceKeyName:
+    Description: EC2 SSH KEY
+    Type: AWS::EC2::KeyPair::KeyName
+  Ec2AutoscaleSize:
+    Description: AutoScalingGroup Size
+    Type: String
+    Default: '1'
+  UserDataURL:
+    Type: String
+    Default: "https://raw.githubusercontent.com/filemage/aws-cloudformation-templates/master/high-availability-rds/userdata/initialize-application.sh"
+
+Resources:
+
+  HostedZone:
+    Type: 'AWS::Route53::HostedZone'
+    Properties:
+      Name: filemage.internal
+      HostedZoneConfig:
+        Comment: "FileMage Private Hosted Zone"
+      VPCs:
+      - VPCId: !Ref 'VpcId'
+        VPCRegion: !Ref 'AWS::Region'
+
+  PostgresRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneName: filemage.internal.
+      Name: database.filemage.internal.
+      Type: CNAME
+      TTL: '900'
+      ResourceRecords:
+        - Fn::Sub: "${PostgresDatabaseInstance.Endpoint.Address}"
+
+  PostgresDatabaseInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBSecurityGroups:
+      - !Ref RDSSecurityGroup
+      AllocatedStorage: '6'
+      DBInstanceClass: db.t2.medium
+      Engine: Postgres
+      EngineVersion: '12.10'
+      DBParameterGroupName: !Ref PostgresParameters
+      MasterUsername: filemage
+      MasterUserPassword: '{{resolve:secretsmanager:PostgresSecret:SecretString}}'
+    DeletionPolicy: Delete
+
+  PostgresParameters:
+    Type: AWS::RDS::DBParameterGroup
+    Properties:
+      Description: "FileMage Postgres Parameters"
+      Family: postgres12
+      Parameters:
+        shared_preload_libraries: pg_stat_statements,pg_cron
+
+  RDSSecurityGroup:
+    Type: AWS::RDS::DBSecurityGroup
+    Properties:
+      DBSecurityGroupIngress:
+        CIDRIP: !Ref 'VpcCidr'
+      GroupDescription: FileMage Postgres
+
+  Ec2InstanceLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        SecurityGroupIds:
+        - !Ref 'Ec2SecurityGroupSSH'
+        TagSpecifications:
+        - ResourceType: instance
+          Tags:
+          - Key: Name
+            Value: FileMageApp
+        InstanceInitiatedShutdownBehavior: terminate
+        KeyName: !Ref 'Ec2InstanceKeyName'
+        ImageId: '{{resolve:ssm:/aws/service/marketplace/prod-qki2qe2jdzgdq/latest}}'
+        InstanceType: !Ref 'Ec2InstanceType'
+        IamInstanceProfile:
+          Name: !Ref 'InstanceProfile'
+        UserData:
+          Fn::Base64:
+            !Sub |
+              #!/bin/bash
+              curl "${UserDataURL}" | bash -s "${AppSecret}" "${PostgresSecret}"
+
+  Ec2InstanceAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn: PostgresRecord
+    Properties:
+      VPCZoneIdentifier:
+      - !Ref 'VpcEc2Subnet1'
+      - !Ref 'VpcEc2Subnet2'
+      - !Ref 'VpcEc2Subnet3'
+      LaunchTemplate:
+        LaunchTemplateId: !Ref 'Ec2InstanceLaunchTemplate'
+        Version: !GetAtt 'Ec2InstanceLaunchTemplate.LatestVersionNumber'
+      MinSize: !Ref Ec2AutoscaleSize
+      MaxSize: !Ref Ec2AutoscaleSize
+      DesiredCapacity: !Ref Ec2AutoscaleSize
+      TargetGroupARNs:
+        - !Ref 'Ec2TargetGroupHTTP'
+        - !Ref 'Ec2TargetGroupHTTPS'
+        - !Ref 'Ec2TargetGroupSFTP'
+        - !Ref 'Ec2TargetGroupFTP'
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: FileMageSecretManagerAccess
+      Roles:
+      - !Ref 'InstanceRole'
+
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - ec2.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+
+  SecretsManagerAccessPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: FileMageSecretsManagerAccess
+      PolicyDocument:
+        Statement:
+        - Effect: Allow
+          Action: "secretsmanager:GetSecretValue"
+          Resource:
+          - !Ref 'AppSecret'
+          - !Ref 'PostgresSecret'
+      Roles:
+      - !Ref 'InstanceRole'
+
+  Ec2SecurityGroupSSH:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref 'VpcId'
+      GroupDescription: FileMage Instances
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 22
+        ToPort: 22
+        CidrIp: !Ref 'StaticIPforSSH'
+      - IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+        CidrIp: '0.0.0.0/0'
+      - IpProtocol: tcp
+        FromPort: 443
+        ToPort: 443
+        CidrIp: '0.0.0.0/0'
+      - IpProtocol: tcp
+        FromPort: 2222
+        ToPort: 2222
+        CidrIp: '0.0.0.0/0'
+      - IpProtocol: tcp
+        FromPort: 21
+        ToPort: 21
+        CidrIp: '0.0.0.0/0'
+      - IpProtocol: tcp
+        FromPort: 32768
+        ToPort: 60999
+        CidrIp: '0.0.0.0/0'
+
+  Ec2TargetGroupHTTP:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref 'VpcId'
+      Port: 80
+      Protocol: TCP
+
+  Ec2TargetGroupHTTPS:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref 'VpcId'
+      Port: 443
+      Protocol: TCP
+
+  Ec2TargetGroupSFTP:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref 'VpcId'
+      Port: 2222
+      Protocol: TCP
+
+  Ec2TargetGroupFTP:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref 'VpcId'
+      Port: 21
+      Protocol: TCP
+
+  ALBListenerHTTP:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref Ec2TargetGroupHTTP
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: TCP
+
+  ALBListenerHTTPS:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref 'Ec2TargetGroupHTTPS'
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 443
+      Protocol: TCP
+
+  ALBListenerSFTP:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref 'Ec2TargetGroupSFTP'
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 22
+      Protocol: TCP
+
+  ALBListenerFTP:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref 'Ec2TargetGroupFTP'
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 21
+      Protocol: TCP
+
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Type: network
+      Scheme: internet-facing
+      Subnets:
+      - !Ref 'VpcEc2Subnet1'
+      - !Ref 'VpcEc2Subnet2'
+      - !Ref 'VpcEc2Subnet3'
+
+  AppSecret:
+      Type: AWS::SecretsManager::Secret
+      Properties:
+          Name: 'AppSecret'
+          Description: 'Generate app secret.'
+          GenerateSecretString:
+            PasswordLength: 16
+
+  PostgresSecret:
+      Type: AWS::SecretsManager::Secret
+      Properties:
+          Name: 'PostgresSecret'
+          Description: 'Generate app secret.'
+          GenerateSecretString:
+            ExcludePunctuation: true
+            PasswordLength: 8
+
+Outputs:
+  LoadBalancerUrl:
+    Description: The URL of the ALB
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
