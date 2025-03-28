@@ -1,5 +1,7 @@
 #!/bin/bash -ex
 
+filemage update -y
+
 apt-get update && apt-get install -y awscli jq
 
 aws configure set region $(curl --silent http://169.254.169.254/latest/dynamic/instance-identity/document | jq -r .region)

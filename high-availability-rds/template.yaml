@@ -9,7 +9,7 @@ Parameters:
     Description: VPC CIDR
     Type: String
   StaticIPforSSH:
-    Description: Static IP for SSH access
+    Description: SSH allow CIDR
     Type: String
   VpcEc2Subnet1:
     Description: EC2 subnet 1(AZ-a)
@@ -23,7 +23,6 @@ Parameters:
   Ec2InstanceType:
     Description: EC2 InstanceType
     Type: String
-    Default: m5.large
   Ec2InstanceKeyName:
     Description: EC2 SSH KEY
     Type: AWS::EC2::KeyPair::KeyName
@@ -63,9 +62,9 @@ Resources:
       DBSecurityGroups:
       - !Ref RDSSecurityGroup
       AllocatedStorage: '6'
-      DBInstanceClass: db.t2.medium
+      DBInstanceClass: db.t4g.micro
       Engine: Postgres
-      EngineVersion: '12.10'
+      EngineVersion: '16.8'
       DBParameterGroupName: !Ref PostgresParameters
       MasterUsername: filemage
       MasterUserPassword: '{{resolve:secretsmanager:PostgresSecret:SecretString}}'
@@ -75,7 +74,7 @@ Resources:
     Type: AWS::RDS::DBParameterGroup
     Properties:
       Description: "FileMage Postgres Parameters"
-      Family: postgres12
+      Family: postgres16
       Parameters:
         shared_preload_libraries: pg_stat_statements,pg_cron
 
